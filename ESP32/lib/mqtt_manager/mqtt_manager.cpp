@@ -1,13 +1,16 @@
 #include "mqtt_manager.h"
 #include "secrets.h"
 #include "config.h"
+#include "FeedGate.h"
+#include "mixer.h"
 
+#include <WiFiClientSecure.h>
 #include <WiFi.h>
 #include <PubSubClient.h>
 #include <ArduinoJson.h>
 
 // ── Private objects ───────────────────────────────────────────
-static WiFiClient   wifiClient;
+static WiFiClientSecure wifiClient;
 static PubSubClient mqttClient(wifiClient);
 
 // ── Forward declarations ──────────────────────────────────────
@@ -20,10 +23,12 @@ void mqtt_manager_setup() {
     Serial.println("[WiFi] Menghubungkan ke: " WIFI_SSID);
     _wifi_connect();
 
+    wifiClient.setInsecure(); // testing, jangan pakai ini di produksi!
+
     mqttClient.setServer(MQTT_BROKER, MQTT_PORT);
     mqttClient.setCallback(_mqtt_callback);
     mqttClient.setKeepAlive(60);
-    mqttClient.setBufferSize(512);
+    mqttClient.setBufferSize(1024);
 
     _mqtt_connect();
 }
@@ -48,9 +53,8 @@ void mqtt_manager_loop() {
 // feed_level_pct / feed_distance_mm = -1 jika sensor tidak ada
 // ─────────────────────────────────────────────────────────────
 bool mqtt_publish_sensors(float temperature,
-                          int   turbidity_raw,
-                          float moisture_pct,
-                          int   moisture_raw,
+                          float ph,
+                          int   turbidity_get_filtered,
                           float feed_level_pct,
                           int   feed_distance_mm,
                           bool  feed_sensor_ok) {
@@ -61,11 +65,17 @@ bool mqtt_publish_sensors(float temperature,
 
     JsonDocument doc;
 
-    // ── Water sensors ─────────────────────────────────────────
-    doc["temperature"]    = serialized(String(temperature, 2));
-    doc["turbidity_raw"]  = turbidity_raw;
-    doc["moisture_pct"]   = serialized(String(moisture_pct, 1));
-    doc["moisture_raw"]   = moisture_raw;
+// ── Water sensors ─────────────────────────────────────────
+    if (temperature == -999.0f) {
+        Serial.println("[MQTT] ⚠️ Suhu error — temperature dikirim null");
+        doc["temperature"] = nullptr;
+    } else {
+        doc["temperature"] = serialized(String(temperature, 2));
+    }
+    doc["ph"] = serialized(String(ph, 2));
+
+    // ── Turbidity Edge Computing Data ─────────────────────────
+    doc["turbidity_filtered"] = turbidity_get_filtered;
 
     // ── Feed level sensor ─────────────────────────────────────
     doc["feed_sensor_ok"] = feed_sensor_ok;
@@ -77,11 +87,15 @@ bool mqtt_publish_sensors(float temperature,
         doc["feed_distance_mm"] = nullptr;
     }
 
+    // ── Mixer status ──────────────────────────────────────────
+    doc["mixer_on"]             = mixer_is_on();
+    doc["mixer_remaining_sec"]  = mixer_remaining_sec();
+    doc["mixer_schedule_count"] = mixer_schedule_count();
     // ── Metadata ──────────────────────────────────────────────
     doc["rssi"]      = WiFi.RSSI();
     doc["uptime_ms"] = millis();
 
-    char payload[384];
+    char payload[512];
     serializeJson(doc, payload);
 
     bool ok = mqttClient.publish(MQTT_TOPIC_SENSORS, payload, false);
@@ -151,16 +165,19 @@ static void _mqtt_connect() {
             Serial.println("[MQTT] ✅ Terhubung ke broker!");
             mqttClient.subscribe(MQTT_TOPIC_CMD_FEED);
             Serial.printf("[MQTT] 📡 Subscribe: %s\n", MQTT_TOPIC_CMD_FEED);
+            mqttClient.subscribe(MQTT_TOPIC_CMD_MIXER);
+            Serial.printf("[MQTT] 📡 Subscribe: %s\n", MQTT_TOPIC_CMD_MIXER);
+            mqttClient.subscribe(MQTT_TOPIC_CMD_MIXER_SCHEDULES);
+            Serial.printf("[MQTT] 📡 Subscribe: %s\n", MQTT_TOPIC_CMD_MIXER_SCHEDULES);
         } else {
-            Serial.printf("[MQTT] ❌ Gagal (rc=%d), retry %d/3...\n",
-                          mqttClient.state(), retries + 1);
+            Serial.printf("[MQTT] ❌ Gagal (rc=%d) Wifi=%d IP=%s, retry %d/3...\n",
+                          mqttClient.state(), WiFi.status(), WiFi.localIP().toString().c_str(), retries + 1);
             delay(3000);
             retries++;
         }
     }
 }
 
-// ─────────────────────────────────────────────────────────────
 static void _mqtt_callback(char* topic, byte* payload, unsigned int length) {
     char msg[length + 1];
     memcpy(msg, payload, length);
@@ -169,23 +186,91 @@ static void _mqtt_callback(char* topic, byte* payload, unsigned int length) {
     Serial.printf("[MQTT] ← Pesan masuk | Topic: %s\n", topic);
     Serial.printf("[MQTT]   Payload: %s\n", msg);
 
+    // =========================================================
+    // 1. BLOK PENANGANAN PERINTAH PAKAN (FEEDGATE)
+    // =========================================================
     if (strcmp(topic, MQTT_TOPIC_CMD_FEED) == 0) {
         JsonDocument doc;
         DeserializationError err = deserializeJson(doc, msg);
 
         if (err) {
-            Serial.println("[MQTT] JSON tidak valid!");
+            Serial.println("[MQTT] ❌ JSON tidak valid untuk FEEDING!");
             return;
         }
 
+        // Ambil durasi, jika kosong default ke 3 detik
         int duration_sec = doc["duration_sec"] | 3;
-        Serial.printf("[MQTT] 🐟 Perintah FEEDING diterima! Durasi: %d detik\n", duration_sec);
+        
+        // Ambil tipe trigger dari backend, jika kosong default ke "remote"
+        const char* trigger_type = doc["trigger_type"] | "remote"; 
 
-        // TODO: aktifkan motor feeder
-        // digitalWrite(PIN_FEEDER_MOTOR, HIGH);
-        // delay(duration_sec * 1000);
-        // digitalWrite(PIN_FEEDER_MOTOR, LOW);
+        Serial.printf("[MQTT] 🐟 Perintah FEEDING diterima! Durasi: %d detik | Tipe: %s\n", duration_sec, trigger_type);
 
-        mqtt_publish_feeding("remote", duration_sec);
+        // EKSEKUSI BUKA GERBANG PAKAN
+        feedGate_openFor((uint16_t)duration_sec);
+
+        // LAPOR BALIK KE BACKEND AGAR MASUK DATABASE
+        mqtt_publish_feeding(trigger_type, duration_sec);
+    }
+    // =========================================================
+    // 1. BLOK PENANGANAN PERINTAH FEEDER ON/OFF
+    // =========================================================
+    else if (strcmp(topic, MQTT_TOPIC_CMD_FEED) == 0) {
+        JsonDocument doc;
+        DeserializationError err = deserializeJson(doc, msg);
+
+        if (err) {
+            Serial.println("[MQTT] ❌ JSON tidak valid (mixer)!");
+            return;
+        }
+        bool is_on = doc["is_on"] | false;
+        uint16_t duration_min = doc["duration_min"] | 5;
+
+        if (is_on) {
+            mixer_turn_on(duration_min);
+            Serial.printf("[MQTT] 🔀 Feeder ON selama %d menit (manual dari app).\n", duration_min);
+        } else {
+            mixer_turn_off();
+            Serial.println("[MQTT] 🔀 Feeder OFF (manual dari app).");
+        }
+    }
+    // =========================================================
+    // 2. BLOK PENANGANAN PERINTAH MIXER ON/OFF
+    // =========================================================
+    else if (strcmp(topic, MQTT_TOPIC_CMD_MIXER) == 0) {
+        JsonDocument doc;
+        DeserializationError err = deserializeJson(doc, msg);
+
+        if (err) {
+            Serial.println("[MQTT] ❌ JSON tidak valid (mixer)!");
+            return;
+        }
+        bool is_on = doc["is_on"] | false;
+        uint16_t duration_min = doc["duration_min"] | 5;
+
+        if (is_on) {
+            mixer_turn_on(duration_min);
+            Serial.printf("[MQTT] 🔀 Mixer ON selama %d menit (manual dari app).\n", duration_min);
+        } else {
+            mixer_turn_off();
+            Serial.println("[MQTT] 🔀 Mixer OFF (manual dari app).");
+        }
+    }
+    // =========================================================
+    // 3. BLOK PENANGANAN JADWAL MIXER
+    // =========================================================
+    else if (strcmp(topic, MQTT_TOPIC_CMD_MIXER_SCHEDULES) == 0) {
+        JsonDocument doc;
+        DeserializationError err = deserializeJson(doc, msg);
+
+        if (err || !doc["schedules"].is<JsonArray>()) {
+            Serial.println("[MQTT] ❌ JSON tidak valid (mixer_schedules)!");
+            return;
+        }
+
+        String schedulesJson;
+        serializeJson(doc["schedules"], schedulesJson);
+        mixer_set_schedules(schedulesJson);
+        Serial.println("[MQTT] 🔀 Jadwal mixer diupdate dari app.");
     }
 }

@@ -1,21 +1,229 @@
+import 'dart:async';
 import 'package:flutter/material.dart';
+import 'package:fl_chart/fl_chart.dart';
+import 'package:supabase_flutter/supabase_flutter.dart';
 import '../models/sensor_model.dart';
 
 class SensorProvider extends ChangeNotifier {
-  // Initialize with some default values (these will be updated when we fetch real data)
-  SensorModel _sensorData = SensorModel(
-    temperature: 28.5,
-    phLevel: 7.2,
-    turbidity: 15.0,
-    waterLevel: 50.0,
+  final _supabase = Supabase.instance.client;
+
+  SensorModel _currentData = SensorModel(
+    temperature: 0.0,
+    tempStatus: 'waiting...',
+    phLevel: 0.0,
+    phStatus: 'waiting...',
+    turbidityRaw: 0,
+    turbidityStatus: 'waiting...',
+    feedLevelPct: 0.0,
+    feedStatus: 'waiting...',
   );
 
-  // Getter for allowing the UI to read the current sensor data
-  SensorModel get sensorData => _sensorData;
+  SensorModel get currentData => _currentData;
 
-  // Method to update the sensor data and notify listeners (UI) to rebuild
-  void updateSensorData(SensorModel newData) {
-    _sensorData = newData;
-    notifyListeners(); // This tells the UI to rebuild with the new data
+  final List<FlSpot> _tempHistory = [];
+  final List<FlSpot> _phHistory = [];
+  final List<FlSpot> _feedLevelHistory = [];
+
+  double _timeIndex = 0;
+
+  List<FlSpot> get tempHistory => _tempHistory;
+  List<FlSpot> get phHistory => _phHistory;
+  List<FlSpot> get feedLevelHistory => _feedLevelHistory;
+
+  Timer? _fetchTimer;
+  Timer? _statusTimer;
+
+  bool _isDispensing = false;
+  bool get isDispensing => _isDispensing;
+
+  bool _isDeviceOnline = false;
+  bool get isDeviceOnline => _isDeviceOnline;
+
+  DateTime? _lastFed;
+  DateTime? get lastFed => _lastFed;
+
+  SensorProvider() {
+    _startRealDataFetch();
+    fetchLastFedTime();
+  }
+
+  // === FETCH DATA FROM DATABASE FUNCTION ===
+  void _startRealDataFetch() {
+    _fetchLatestData();
+
+    _fetchTimer = Timer.periodic(const Duration(seconds: 10), (timer) {
+      _fetchLatestData();
+    });
+
+    _statusTimer = Timer.periodic(const Duration(seconds: 30), (timer) {
+      _evaluateDeviceStatus();
+    });
+  }
+
+  void _evaluateDeviceStatus() {
+    if (_currentData.recordedAt == null) {
+      if (_isDeviceOnline) {
+        _isDeviceOnline = false;
+        notifyListeners();
+      }
+      return;
+    }
+
+    final difference = DateTime.now().difference(_currentData.recordedAt!);
+    final isCurrentlyOnline = difference.inMinutes < 3;
+
+    if (_isDeviceOnline != isCurrentlyOnline) {
+      _isDeviceOnline = isCurrentlyOnline;
+      notifyListeners();
+    }
+  }
+
+  Future<void> _fetchLatestData() async {
+    try {
+      final response = await _supabase
+          .from('latest_readings')
+          .select()
+          .limit(1);
+
+      if (response.isNotEmpty) {
+        final data = response.first;
+        _currentData = SensorModel.fromJson(data);
+
+        _evaluateDeviceStatus();
+
+        _tempHistory.add(FlSpot(_timeIndex, _currentData.temperature));
+        _phHistory.add(FlSpot(_timeIndex, _currentData.phLevel));
+        _feedLevelHistory.add(FlSpot(_timeIndex, _currentData.feedLevelPct));
+
+        if (_tempHistory.length > 10) _tempHistory.removeAt(0);
+        if (_phHistory.length > 10) _phHistory.removeAt(0);
+        if (_feedLevelHistory.length > 10) _feedLevelHistory.removeAt(0);
+
+        _timeIndex++;
+        notifyListeners();
+      }
+    } catch (e) {
+      debugPrint('Failed to pull original data: $e');
+    }
+  }
+
+  // === TIME FILTER VARIABLES ===
+  int _timeFilterIndex = 0;
+  int get timeFilterIndex => _timeFilterIndex;
+
+  bool _isChartLoading = false;
+  bool get isChartLoading => _isChartLoading;
+
+  Future<void> updateTimeFilter(int index) async {
+    if (_timeFilterIndex == index) return;
+    _timeFilterIndex = index;
+    await fetchHistoricalData();
+  }
+
+  Future<void> fetchHistoricalData() async {
+    _isChartLoading = true;
+    notifyListeners();
+
+    DateTime cutoff;
+    if (_timeFilterIndex == 0) {
+      cutoff = DateTime.now().subtract(const Duration(hours: 24));
+    } else if (_timeFilterIndex == 1) {
+      cutoff = DateTime.now().subtract(const Duration(days: 7));
+    } else {
+      cutoff = DateTime.now().subtract(const Duration(days: 30));
+    }
+
+    try {
+      final response = await _supabase
+          .from('sensor_readings')
+          .select()
+          .gte('recorded_at', cutoff.toIso8601String())
+          .order('recorded_at', ascending: true);
+
+      _tempHistory.clear();
+      _phHistory.clear();
+      _feedLevelHistory.clear();
+
+      if (response.isNotEmpty) {
+        int step = (response.length / 100).ceil();
+        if (step < 1) step = 1;
+
+        double x = 0;
+        for (int i = 0; i < response.length; i += step) {
+          final data = SensorModel.fromJson(response[i]);
+          _tempHistory.add(FlSpot(x, data.temperature));
+          _phHistory.add(FlSpot(x, data.phLevel));
+          _feedLevelHistory.add(FlSpot(x, data.feedLevelPct));
+          x++;
+        }
+        
+        _timeIndex = x; 
+      }
+    } catch (e) {
+      debugPrint('Failed to pull chart history: $e');
+    } finally {
+      _isChartLoading = false;
+      notifyListeners();
+    }
+  }
+
+  String get turbidityStatusText {
+    return _currentData.turbidityStatus ?? 'Unknown';
+  }
+
+  Future<bool> dispenseFeedManual(int durationSec) async {
+    _isDispensing = true;
+    notifyListeners();
+
+    final String deviceId = 'ESP32-DEVKIT-01';
+    final int cooldownTime = durationSec + 5;
+    
+    try {
+      await _supabase.from('feeder_status').upsert({
+        'id': 1, 
+        'device_id': deviceId,
+        'is_on': true,
+        'duration_sec': durationSec,
+        'updated_at': DateTime.now().toIso8601String(),
+      });
+      
+      Future.delayed(Duration(seconds: cooldownTime), () {
+        _isDispensing = false;
+        notifyListeners();
+      });
+
+      return true;
+    } catch (e) {
+      debugPrint('Failed to trigger manual feeding: $e');
+      
+      _isDispensing = false;
+      notifyListeners();
+      return false;
+    }
+  }
+
+  Future<void> fetchLastFedTime() async {
+    try {
+      final response = await _supabase
+          .from('feeding_logs')
+          .select('fed_at')
+          .order('fed_at', ascending: false)
+          .limit(1)
+          .maybeSingle();
+
+      if (response != null) {
+        _lastFed = DateTime.parse(response['fed_at']);
+        notifyListeners();
+      }
+    } catch (e) {
+      debugPrint('Failed to pull last fed time: $e');
+    }
+  }
+
+  @override
+  void dispose() {
+    _fetchTimer?.cancel();
+    _statusTimer?.cancel();
+    super.dispose();
   }
 }

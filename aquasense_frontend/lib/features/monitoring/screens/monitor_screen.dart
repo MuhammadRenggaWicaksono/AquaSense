@@ -1,16 +1,24 @@
 import 'package:flutter/material.dart';
+import 'package:intl/intl.dart';
 import 'package:provider/provider.dart';
 import '../providers/sensor_provider.dart';
 import 'package:google_fonts/google_fonts.dart';
 import 'package:aquasense_frontend/shared/widgets/custom_app_bar.dart';
+import '../../settings/providers/settings_provider.dart';
+import '../../feeding/providers/mixer_provider.dart';
 
 class MonitorScreen extends StatelessWidget {
   const MonitorScreen({super.key});
 
   @override
   Widget build(BuildContext context) {
-    // Read the current sensor data from the provider. Whenever sensorData changes, this widget will rebuild with the new values.
-    final sensorData = context.watch<SensorProvider>().sensorData;
+    final sensorState = context.watch<SensorProvider>();
+    final settingsState = context.watch<SettingsProvider>();
+    final data = sensorState.currentData;
+    final mixerState = context.watch<MixerProvider>();
+    final lastFedTime = sensorState.lastFed != null
+        ? '${DateFormat('HH:mm').format(sensorState.lastFed!)} WITA'
+        : '--:--';
 
     return Scaffold(
       backgroundColor: Colors.transparent,
@@ -29,28 +37,30 @@ class MonitorScreen extends StatelessWidget {
               children: [
                 _buildMetricCard(
                   icon: Icons.thermostat,
-                  value: '${sensorData.temperature}°C',
+                  value: '${data.temperature}°C',
                   label: 'WATER TEMP',
                 ),
                 _buildMetricCard(
                   icon: Icons.water_drop,
-                  value: '${sensorData.phLevel}',
+                  value: '${data.phLevel}',
                   label: 'PH LEVEL',
                 ),
                 _buildMetricCard(
                   icon: Icons.waves,
-                  value: 'Normal', // Static for now, can be dynamic based on turbidity value
+                  value: sensorState.turbidityStatusText
+                      .replaceAll('_', ' ')
+                      .toUpperCase(),
                   label: 'TURBIDITY',
                 ),
                 _buildMetricCard(
                   icon: Icons.inventory_2,
-                  value: '85%', // Static for now, can be dynamic based on feed level value
+                  value: '${data.feedLevelPct.toInt()}%',
                   label: 'FEED LEVEL',
                 ),
               ],
             ),
             const SizedBox(height: 32),
-            
+
             // Control Center
             Row(
               children: [
@@ -67,72 +77,227 @@ class MonitorScreen extends StatelessWidget {
               ],
             ),
             const SizedBox(height: 16),
-            
+
             // Dispense Feed Button
             SizedBox(
               width: double.infinity,
               height: 56,
               child: FilledButton(
                 style: FilledButton.styleFrom(
-                  backgroundColor: const Color(0xFF003355),
+                  backgroundColor: sensorState.isDispensing
+                      ? Colors.grey.shade400
+                      : const Color(0xFF003355),
                   shape: RoundedRectangleBorder(
                     borderRadius: BorderRadius.circular(28),
                   ),
                 ),
-                onPressed: () {
-                  // Logika memicu aktuator blower nantinya
-                },
-                child: const Row(
+                onPressed: sensorState.isDispensing
+                    ? null
+                    : () async {
+                        if (!sensorState.isDeviceOnline) {
+                          ScaffoldMessenger.of(context).showSnackBar(
+                            const SnackBar(
+                              content: Row(
+                                children: [
+                                  Icon(
+                                    Icons.wifi_off,
+                                    color: Colors.white,
+                                    size: 20,
+                                  ),
+                                  SizedBox(width: 8),
+                                  Expanded(
+                                    child: Text(
+                                      'Failed: ESP32 device is offline!',
+                                    ),
+                                  ),
+                                ],
+                              ),
+                              backgroundColor: Color(0xFFC62828),
+                              duration: Duration(seconds: 3),
+                              behavior: SnackBarBehavior.floating,
+                            ),
+                          );
+                          return;
+                        }
+                        ScaffoldMessenger.of(context).showSnackBar(
+                          SnackBar(
+                            content: Text(
+                              'Sending command (${settingsState.manualFeedDuration} seconds)...',
+                            ),
+                            duration: const Duration(seconds: 2),
+                            behavior: SnackBarBehavior.floating,
+                          ),
+                        );
+                        final sukses = await sensorState.dispenseFeedManual(
+                          settingsState.manualFeedDuration,
+                        );
+                        if (context.mounted) {
+                          ScaffoldMessenger.of(context).showSnackBar(
+                            SnackBar(
+                              content: Text(
+                                sukses
+                                    ? 'Feed successfully dispensed! Starting device cooldown...'
+                                    : 'Failed to contact server.',
+                              ),
+                              backgroundColor: sukses
+                                  ? const Color(0xFF0288D1)
+                                  : Colors.red,
+                              behavior: SnackBarBehavior.floating,
+                            ),
+                          );
+                        }
+                      },
+                child: Row(
                   mainAxisAlignment: MainAxisAlignment.spaceBetween,
                   children: [
-                    Text('DISPENSE FEED', style: TextStyle(fontWeight: FontWeight.bold)),
-                    Icon(Icons.restaurant),
+                    Text(
+                      sensorState.isDispensing
+                          ? 'DISPENSING & COOLING DOWN...'
+                          : 'DISPENSE FEED',
+                      style: const TextStyle(fontWeight: FontWeight.bold),
+                    ),
+                    sensorState.isDispensing
+                        ? const SizedBox(
+                            width: 20,
+                            height: 20,
+                            child: CircularProgressIndicator(
+                              color: Colors.white,
+                              strokeWidth: 2,
+                            ),
+                          )
+                        : const Icon(Icons.restaurant),
                   ],
                 ),
               ),
             ),
             const SizedBox(height: 16),
-            
+
             // Water Pump Status
-            Container(
-              padding: const EdgeInsets.all(16),
-              decoration: BoxDecoration(
-                color: Colors.grey.shade200,
-                borderRadius: BorderRadius.circular(16),
-              ),
-              child: Column(
-                children: [
-                  Row(
-                    mainAxisAlignment: MainAxisAlignment.spaceBetween,
-                    children: [
-                      const Row(
-                        children: [
-                          Icon(Icons.water, color: Colors.black54),
-                          SizedBox(width: 8),
-                          Text('Water Pump', style: TextStyle(color: Colors.black87)),
-                        ],
-                      ),
-                      Container(
-                        padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 4),
-                        decoration: BoxDecoration(
-                          color: Colors.grey.shade300,
-                          borderRadius: BorderRadius.circular(12),
+            Row(
+              children: [
+                Expanded(
+                  child: Container(
+                    padding: const EdgeInsets.all(16),
+                    decoration: BoxDecoration(
+                      color: Colors.white,
+                      borderRadius: BorderRadius.circular(24),
+                      boxShadow: [
+                        BoxShadow(
+                          color: Colors.black.withValues(alpha: 0.03),
+                          blurRadius: 10,
+                          offset: const Offset(0, 4),
                         ),
-                        child: const Text('Standby', style: TextStyle(fontSize: 12)),
-                      ),
-                    ],
+                      ],
+                    ),
+                    child: Column(
+                      crossAxisAlignment: CrossAxisAlignment.start,
+                      children: [
+                        Row(
+                          children: [
+                            Container(
+                              padding: const EdgeInsets.all(8),
+                              decoration: BoxDecoration(
+                                color: mixerState.isOn ? const Color(0xFF0288D1) : const Color(0xFFE0F7FA),
+                                shape: BoxShape.circle,
+                              ),
+                              child: Icon(
+                                Icons.autorenew,
+                                color: mixerState.isOn ? Colors.white : const Color(0xFF00BCD4),
+                                size: 16,
+                              ),
+                            ),
+                            const SizedBox(width: 8),
+                            Text(
+                              'MIXER',
+                              style: GoogleFonts.plusJakartaSans(
+                                fontSize: 11,
+                                fontWeight: FontWeight.w900,
+                                color: Colors.black54,
+                                letterSpacing: 0.5,
+                              ),
+                            ),
+                          ],
+                        ),
+                        const SizedBox(height: 16),
+                        FittedBox(
+                          fit: BoxFit.scaleDown,
+                          child: Text(
+                            mixerState.isOn ? 'MIXING (${mixerState.remainingSec}s)' : 'STANDBY', 
+                            style: GoogleFonts.epilogue(
+                              fontSize: 18, 
+                              fontWeight: FontWeight.bold, 
+                              color: mixerState.isOn ? const Color(0xFFFF9800) : const Color(0xFF003355)
+                            )
+                          ),
+                        ),
+                      ],
+                    ),
                   ),
-                  const Divider(height: 24),
-                  const Row(
-                    children: [
-                      Icon(Icons.access_time, size: 16, color: Colors.black54),
-                      SizedBox(width: 8),
-                      Text('Last fed: 16:30 WITA', style: TextStyle(color: Colors.black54)),
-                    ],
+                ),
+                const SizedBox(width: 16),
+                Expanded(
+                  child: Container(
+                    padding: const EdgeInsets.all(16),
+                    decoration: BoxDecoration(
+                      color: Colors.white,
+                      borderRadius: BorderRadius.circular(24),
+                      boxShadow: [
+                        BoxShadow(
+                          color: Colors.black.withValues(alpha: 0.03),
+                          blurRadius: 10,
+                          offset: const Offset(0, 4),
+                        ),
+                      ],
+                    ),
+                    child: Column(
+                      crossAxisAlignment: CrossAxisAlignment.start,
+                      children: [
+                        Row(
+                          children: [
+                            Container(
+                              padding: const EdgeInsets.all(8),
+                              decoration: const BoxDecoration(
+                                color: Color(0xFFFFF3E0),
+                                shape: BoxShape.circle,
+                              ),
+                              child: const Icon(
+                                Icons.restaurant,
+                                color: Color(0xFFFF9800),
+                                size: 16,
+                              ),
+                            ),
+                            const SizedBox(width: 8),
+                            Text(
+                              'LAST FED',
+                              style: GoogleFonts.plusJakartaSans(
+                                fontSize: 11,
+                                fontWeight: FontWeight.w900,
+                                color: Colors.black54,
+                                letterSpacing: 0.5,
+                              ),
+                            ),
+                          ],
+                        ),
+                        const SizedBox(height: 16),
+                        FittedBox(
+                          fit: BoxFit.scaleDown,
+                          alignment: Alignment.centerLeft,
+                          child: Text(
+                            lastFedTime,
+                            style: GoogleFonts.epilogue(
+                              fontSize: 18,
+                              fontWeight: FontWeight.bold,
+                              color: const Color(0xFF003355),
+                            ),
+                          ),
+                        ),
+                      ],
+                    ),
                   ),
-                ],
-              ),
+                ),
+              ],
             ),
+            const SizedBox(height: 32),
           ],
         ),
       ),
@@ -140,7 +305,11 @@ class MonitorScreen extends StatelessWidget {
   }
 
   // Helper widget for building each metric card with consistent styling
-  Widget _buildMetricCard({required IconData icon, required String value, required String label}) {
+  Widget _buildMetricCard({
+    required IconData icon,
+    required String value,
+    required String label,
+  }) {
     return Container(
       padding: const EdgeInsets.all(16),
       decoration: BoxDecoration(
@@ -167,12 +336,16 @@ class MonitorScreen extends StatelessWidget {
             child: Icon(icon, color: const Color(0xFF0288D1)),
           ),
           const Spacer(),
-          Text(
-            value,
-            style: GoogleFonts.epilogue(
-              fontSize: 28,
-              fontWeight: FontWeight.bold,
-              color: const Color(0xFF003355),
+          FittedBox(
+            fit: BoxFit.scaleDown,
+            alignment: Alignment.centerLeft,
+            child: Text(
+              value,
+              style: GoogleFonts.epilogue(
+                fontSize: 28,
+                fontWeight: FontWeight.bold,
+                color: const Color(0xFF003355),
+              ),
             ),
           ),
           const SizedBox(height: 4),

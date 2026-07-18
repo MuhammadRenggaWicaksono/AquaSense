@@ -1,9 +1,11 @@
-import 'package:flutter/material.dart';
+import 'package:aquasense_frontend/features/monitoring/widgets/feed_level_card.dart';
 import 'package:fl_chart/fl_chart.dart';
+import 'package:flutter/material.dart';
+import 'package:provider/provider.dart';
 import 'package:aquasense_frontend/shared/widgets/custom_app_bar.dart';
+import '../providers/sensor_provider.dart';
 import '../widgets/metric_chart_card.dart';
 import '../widgets/time_filter.dart';
-import '../widgets/feed_level_card.dart';
 
 class StatisticScreen extends StatefulWidget {
   const StatisticScreen({super.key});
@@ -13,8 +15,33 @@ class StatisticScreen extends StatefulWidget {
 }
 
 class _StatisticScreenState extends State<StatisticScreen> {
+  Color _getStatusColor(String? status) {
+    if (status == null) return Colors.grey;
+
+    final s = status.toUpperCase();
+
+    if (s.contains('NORMAL') || s.contains('OPTIMAL') || s.contains('GOOD')) {
+      return const Color(0xFF00897B);
+    } else if (s.contains('HIGH') ||
+        s.contains('LOW') ||
+        s.contains('WARNING')) {
+      return Colors.orange.shade700;
+    } else if (s.contains('ERROR') ||
+        s.contains('CRITICAL') ||
+        s.contains('DANGER')) {
+      return const Color(0xFFD32F2F);
+    }
+
+    return Colors.black87;
+  }
+
   @override
   Widget build(BuildContext context) {
+    final sensorState = context.watch<SensorProvider>();
+    final data = sensorState.currentData;
+
+    final isDataLoading = sensorState.isChartLoading;
+
     return Scaffold(
       backgroundColor: Colors.transparent,
       appBar: const CustomAppBar(),
@@ -23,17 +50,9 @@ class _StatisticScreenState extends State<StatisticScreen> {
         child: Column(
           children: [
             TimeFilter(
+              selectedIndex: sensorState.timeFilterIndex,
               onFilterChanged: (index) {
-                setState(() {
-                  // In this block, it can update the data displayed in the charts based on the selected time filter. For example:
-                  // if (index == 0) {
-                  //   // Load data for last 24 hours
-                  // } else if (index == 1) {
-                  //   // Load data for last 7 days
-                  // } else if (index == 2) {
-                  //   // Load data for last 30 days
-                  // }
-                });
+                sensorState.updateTimeFilter(index);
               },
             ),
             const SizedBox(height: 24),
@@ -41,64 +60,68 @@ class _StatisticScreenState extends State<StatisticScreen> {
             // Card 1: Water Temperature
             MetricChartCard(
               title: 'Water Temperature',
+              isLoading: isDataLoading,
               icon: Icons.thermostat,
               iconColor: const Color(0xFF00BCD4),
-              badgeText: 'Stable',
+              badgeText: 'Live',
               badgeColor: const Color(0xFFE0F7FA),
               badgeTextColor: const Color(0xFF0097A7),
-              subTitle: 'Last 24 Hours',
-              chartData: [
-                const FlSpot(0, 27.5),
-                const FlSpot(2, 27.8),
-                const FlSpot(4, 28.2),
-                const FlSpot(6, 28.1),
-                const FlSpot(8, 28.8),
-                const FlSpot(10, 29.0),
-                const FlSpot(12, 28.5),
-              ],
+              subTitle: 'Current Water Temp',
+              chartData: sensorState.tempHistory,
+              statsBox1Title: 'CURRENT',
+              statsBox1Value: '${data.temperature}°C',
+              statsBox2Title: 'STATUS',
+              statsBox2Value: (data.tempStatus ?? 'Normal')
+                  .replaceAll('_', ' ')
+                  .toUpperCase(),
+              statsBox2ValueColor: _getStatusColor(data.tempStatus),
               lineColor: const Color(0xFF4DD0E1),
               gradientColors: [
                 const Color(0xFF4DD0E1).withValues(alpha: 0.5),
                 const Color(0xFF4DD0E1).withValues(alpha: 0.0),
               ],
-              statsBox1Title: 'AVERAGE',
-              statsBox1Value: '28.2°C',
-              statsBox2Title: 'RANGE',
-              statsBox2Value: '27.5 - 29.0',
             ),
             const SizedBox(height: 16),
 
             // Card 2: pH Level
             MetricChartCard(
               title: 'pH Level',
+              isLoading: isDataLoading,
               icon: Icons.water_drop,
-              iconColor: const Color(0xFF003355),
-              badgeText: 'Optimal',
-              badgeColor: const Color(0xFFECEFF1),
-              badgeTextColor: const Color(0xFF455A64),
-              subTitle: 'Last 24 Hours',
-              chartData: [
-                const FlSpot(0, 7.1),
-                const FlSpot(3, 7.12),
-                const FlSpot(6, 7.15),
-                const FlSpot(9, 7.14),
-                const FlSpot(12, 7.18),
-              ],
-              lineColor: const Color(0xFF003355),
+              iconColor: const Color(0xFF00897B),
+              badgeText: 'Live',
+              badgeColor: const Color(0xFFE0F2F1),
+              badgeTextColor: const Color(0xFF00695C),
+              subTitle: 'Live Monitoring',
+              chartData: sensorState.phHistory,
+              statsBox1Title: 'CURRENT',
+              statsBox1Value: '${data.phLevel}',
+              statsBox2Title: 'STATUS',
+              statsBox2Value: (data.phStatus ?? 'Optimal')
+                  .replaceAll('_', ' ')
+                  .toUpperCase(),
+              statsBox2ValueColor: _getStatusColor(data.phStatus),
+              lineColor: const Color(0xFF4DB6AC),
               gradientColors: [
-                const Color(0xFF003355).withValues(alpha: 0.3),
-                const Color(0xFF003355).withValues(alpha: 0.0),
+                const Color(0xFF4DB6AC).withValues(alpha: 0.3),
+                const Color(0xFF4DB6AC).withValues(alpha: 0.0),
               ],
-              statsBox1Title: 'AVERAGE',
-              statsBox1Value: '7.15',
-              statsBox2Title: 'STABILITY',
-              statsBox2Value: 'High',
               isStatsValue2Text: true,
             ),
             const SizedBox(height: 16),
 
-            // Card 3: Feed Level
-            const FeedLevelCard(),
+            // Card 3: Feed Level Gauge
+            FeedLevelCard(
+              currentLevel: data.feedLevelPct,
+              feedHistory: const [
+                FlSpot(0, 100),
+                FlSpot(2, 100),
+                FlSpot(2, 80),
+                FlSpot(4, 80),
+                FlSpot(4, 52),
+                FlSpot(7, 52),
+              ],
+            ),
           ],
         ),
       ),
